@@ -109,7 +109,6 @@
         }
 
         // ========== Audio Context for Output ==========
-        // This is THE KEY - Recall.ai captures audio from AudioContext destination
         let audioContext = null;
         let nextPlayTime = 0;
 
@@ -120,7 +119,6 @@
                 });
                 log('AudioContext created: ' + audioContext.state);
             }
-
             if (audioContext.state === 'suspended') {
                 await audioContext.resume();
                 log('AudioContext resumed');
@@ -128,44 +126,31 @@
             return audioContext;
         }
 
-        // ========== PCM Audio Playback via Web Audio API ==========
+        // ========== PCM Audio Playback ==========
         async function playPCMAudio(base64Audio, sampleRate = 16000) {
             try {
                 const ctx = await initAudioContext();
-
-                // Decode base64 to bytes
                 const binaryString = atob(base64Audio);
                 const bytes = new Uint8Array(binaryString.length);
                 for (let i = 0; i < binaryString.length; i++) {
                     bytes[i] = binaryString.charCodeAt(i);
                 }
-
-                // Convert Int16 PCM to Float32
                 const int16 = new Int16Array(bytes.buffer);
                 const float32 = new Float32Array(int16.length);
                 for (let i = 0; i < int16.length; i++) {
                     float32[i] = int16[i] / 32768.0;
                 }
-
-                // Create audio buffer
                 const audioBuffer = ctx.createBuffer(1, float32.length, sampleRate);
                 audioBuffer.getChannelData(0).set(float32);
-
-                // Schedule playback for gapless audio
                 const source = ctx.createBufferSource();
                 source.buffer = audioBuffer;
-
                 const gainNode = ctx.createGain();
                 gainNode.gain.value = 1.0;
-
                 source.connect(gainNode);
                 gainNode.connect(ctx.destination);
-
-                // Gapless scheduling
                 const startTime = Math.max(ctx.currentTime, nextPlayTime);
                 source.start(startTime);
                 nextPlayTime = startTime + audioBuffer.duration;
-
                 return audioBuffer.duration;
             } catch (e) {
                 log('Audio error: ' + e.message, 'error');
@@ -173,7 +158,7 @@
             }
         }
 
-        // ========== Microphone Capture ==========
+        // ========== Microphone ==========
         async function getMicrophone() {
             log('Requesting microphone...');
             try {
@@ -194,28 +179,29 @@
             }
         }
 
-        // ========== WebSocket to ElevenLabs ==========
+        // ========== WebSocket ==========
         let ws = null;
         let isConnected = false;
+        let micStream = null;
 
         async function connectToElevenLabs() {
             setStatus('Connecting...', 'default');
 
             try {
                 await initAudioContext();
-                const micStream = await getMicrophone();
+                micStream = await getMicrophone();
 
-                // Connect WebSocket
                 const wsUrl = `wss://api.elevenlabs.io/v1/convai/conversation?agent_id=${AGENT_ID}`;
                 log('Connecting to ElevenLabs...');
 
                 ws = new WebSocket(wsUrl);
 
                 ws.onopen = () => {
-                    log('Connected!', 'success');
-                    isConnected = true;
-                    setStatus('Listening...', 'listening');
-                    startAudioCapture(micStream);
+                    log('WebSocket open, sending init...', 'success');
+                    // MUST send initialization message first
+                    ws.send(JSON.stringify({
+                        type: "conversation_initiation_client_data"
+                    }));
                 };
 
                 ws.onmessage = (event) => {
@@ -223,7 +209,7 @@
                         const msg = JSON.parse(event.data);
                         handleWSMessage(msg);
                     } catch (e) {
-                        log('Parse error', 'error');
+                        log('Parse error: ' + e.message, 'error');
                     }
                 };
 
@@ -232,8 +218,8 @@
                     setStatus('Error', 'error');
                 };
 
-                ws.onclose = () => {
-                    log('Disconnected, reconnecting in 3s...');
+                ws.onclose = (e) => {
+                    log(`Disconnected (${e.code}), reconnecting...`);
                     isConnected = false;
                     setStatus('Reconnecting...', 'error');
                     setTimeout(connectToElevenLabs, 3000);
@@ -247,13 +233,17 @@
         }
 
         function handleWSMessage(msg) {
+            log('MSG: ' + msg.type);
+
             switch (msg.type) {
                 case 'conversation_initiation_metadata':
-                    log('Session: ' + msg.conversation_id);
+                    log('Session started: ' + msg.conversation_id, 'success');
+                    isConnected = true;
+                    setStatus('Listening...', 'listening');
+                    startAudioCapture(micStream);
                     break;
 
                 case 'audio':
-                    // RAFIKI IS SPEAKING - play via Web Audio API
                     if (msg.audio?.chunk) {
                         setStatus('Speaking...', 'speaking');
                         playPCMAudio(msg.audio.chunk, msg.audio.sample_rate || 16000);
@@ -262,13 +252,13 @@
 
                 case 'agent_response':
                     if (msg.agent_response) {
-                        log('Rafiki: ' + msg.agent_response.substring(0, 60));
+                        log('Rafiki: ' + msg.agent_response.substring(0, 80));
                     }
                     break;
 
                 case 'user_transcript':
                     if (msg.user_transcript) {
-                        log('You: ' + msg.user_transcript.substring(0, 60));
+                        log('You: ' + msg.user_transcript.substring(0, 80));
                     }
                     break;
 
@@ -277,14 +267,26 @@
                     break;
 
                 case 'ping':
-                    if (ws?.readyState === WebSocket.OPEN) {
-                        ws.send(JSON.stringify({ type: 'pong' }));
+                    if (ws?.readyState === WebSocket.OPEN && msg.ping_event) {
+                        // Respond with correct pong format including event_id
+                        setTimeout(() => {
+                            ws.send(JSON.stringify({
+                                type: 'pong',
+                                event_id: msg.ping_event.event_id
+                            }));
+                        }, msg.ping_event.ping_ms || 0);
                     }
                     break;
 
                 case 'error':
-                    log('Error: ' + (msg.message || msg.error), 'error');
+                    log('Error: ' + JSON.stringify(msg), 'error');
                     break;
+
+                default:
+                    // Log unknown message types for debugging
+                    if (msg.type) {
+                        log('Unknown: ' + msg.type);
+                    }
             }
         }
 
@@ -297,33 +299,30 @@
                 if (!isConnected || ws?.readyState !== WebSocket.OPEN) return;
 
                 const input = e.inputBuffer.getChannelData(0);
-
-                // Convert Float32 to Int16 PCM
                 const int16 = new Int16Array(input.length);
                 for (let i = 0; i < input.length; i++) {
                     const s = Math.max(-1, Math.min(1, input[i]));
                     int16[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
                 }
 
-                // Base64 encode
                 const uint8 = new Uint8Array(int16.buffer);
                 let binary = '';
                 for (let i = 0; i < uint8.length; i++) {
                     binary += String.fromCharCode(uint8[i]);
                 }
 
+                // Correct format: user_audio_chunk (not type: audio)
                 ws.send(JSON.stringify({
-                    type: 'audio',
-                    audio: { chunk: btoa(binary), sample_rate: 16000 }
+                    user_audio_chunk: btoa(binary)
                 }));
             };
 
             source.connect(processor);
             processor.connect(captureCtx.destination);
-            log('Audio capture started', 'success');
+            log('Audio streaming started', 'success');
         }
 
-        // ========== Keep AudioContext alive ==========
+        // Keep alive
         setInterval(async () => {
             if (audioContext?.state === 'suspended') {
                 await audioContext.resume();
@@ -331,7 +330,7 @@
         }, 3000);
 
         // ========== AUTO-START ==========
-        log('Rafiki Meeting Agent v2 loaded');
+        log('Rafiki Meeting Agent v3 loaded');
         log('Auto-starting in 1 second...');
 
         setTimeout(() => {
