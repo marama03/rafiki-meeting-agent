@@ -1,0 +1,146 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Rafiki Meeting Agent</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
+            color: #eee;
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            min-height: 100vh;
+        }
+        .container { text-align: center; padding: 40px; }
+        .logo { font-size: 80px; margin-bottom: 20px; }
+        .title {
+            font-size: 32px; font-weight: 600; margin-bottom: 10px;
+            background: linear-gradient(90deg, #667eea 0%, #764ba2 100%);
+            -webkit-background-clip: text; -webkit-text-fill-color: transparent;
+        }
+        .status { font-size: 18px; color: #888; margin-bottom: 30px; }
+        .indicator {
+            display: inline-block; width: 12px; height: 12px; border-radius: 50%;
+            background: #f39c12; margin-right: 8px; animation: pulse 2s infinite;
+        }
+        .indicator.connected { background: #2ecc71; }
+        .indicator.error { background: #e74c3c; }
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.5; }
+        }
+        #debug {
+            position: fixed; bottom: 10px; left: 10px; right: 10px;
+            font-size: 10px; color: #888; max-height: 120px; overflow-y: auto;
+            font-family: monospace; background: rgba(0,0,0,0.5); padding: 10px;
+            border-radius: 5px;
+        }
+        /* Position widget in corner */
+        elevenlabs-convai {
+            position: fixed !important;
+            bottom: 150px !important;
+            right: 20px !important;
+        }
+    </style>
+    <script src="https://unpkg.com/@elevenlabs/convai-widget-embed" async></script>
+</head>
+<body>
+    <div class="container">
+        <div class="logo">🦁</div>
+        <h1 class="title">Rafiki</h1>
+        <p class="status">
+            <span class="indicator" id="statusIndicator"></span>
+            <span id="statusText">Loading widget...</span>
+        </p>
+    </div>
+    <div id="debug"></div>
+
+    <!-- ElevenLabs Widget -->
+    <elevenlabs-convai agent-id="agent_5801kdgpnzv8e3qvqq4r18k7v7p7"></elevenlabs-convai>
+
+    <script>
+        const statusText = document.getElementById('statusText');
+        const statusIndicator = document.getElementById('statusIndicator');
+        const debug = document.getElementById('debug');
+
+        function log(msg) {
+            console.log('[Rafiki]', msg);
+            const line = document.createElement('div');
+            line.textContent = new Date().toLocaleTimeString() + ' ' + msg;
+            debug.appendChild(line);
+            debug.scrollTop = debug.scrollHeight;
+            if (debug.children.length > 20) debug.removeChild(debug.firstChild);
+        }
+
+        log('Page loaded');
+
+        // Wait for widget to load then auto-click
+        let clickAttempts = 0;
+        const maxClickAttempts = 30;
+
+        function tryAutoStart() {
+            clickAttempts++;
+            log('Auto-start attempt ' + clickAttempts);
+
+            const widget = document.querySelector('elevenlabs-convai');
+            if (!widget) {
+                log('Widget element not found');
+                if (clickAttempts < maxClickAttempts) setTimeout(tryAutoStart, 1000);
+                return;
+            }
+
+            if (!widget.shadowRoot) {
+                log('Shadow root not ready');
+                if (clickAttempts < maxClickAttempts) setTimeout(tryAutoStart, 1000);
+                return;
+            }
+
+            // Try to find and click the button
+            const button = widget.shadowRoot.querySelector('button');
+            if (button) {
+                log('Found button, clicking...');
+                button.click();
+                statusText.textContent = 'Widget activated';
+                statusIndicator.className = 'indicator connected';
+
+                // Monitor for connection status
+                setTimeout(checkConnection, 2000);
+            } else {
+                log('Button not found in shadow DOM');
+                // Try clicking the widget itself
+                widget.click();
+                if (clickAttempts < maxClickAttempts) setTimeout(tryAutoStart, 1000);
+            }
+        }
+
+        function checkConnection() {
+            const widget = document.querySelector('elevenlabs-convai');
+            if (widget && widget.shadowRoot) {
+                const inner = widget.shadowRoot.innerHTML;
+                if (inner.includes('listening') || inner.includes('speaking')) {
+                    log('Widget appears active');
+                    statusText.textContent = 'Active';
+                    statusIndicator.className = 'indicator connected';
+                }
+            }
+            setTimeout(checkConnection, 5000);
+        }
+
+        // Start auto-click attempts after widget script loads
+        setTimeout(tryAutoStart, 2000);
+
+        // Also request mic permission proactively
+        navigator.mediaDevices.getUserMedia({ audio: true })
+            .then(stream => {
+                log('Microphone permission granted');
+                stream.getTracks().forEach(t => t.stop());
+            })
+            .catch(e => log('Mic permission: ' + e.message));
+    </script>
+</body>
+</html>
