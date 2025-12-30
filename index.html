@@ -28,119 +28,315 @@
             display: inline-block; width: 12px; height: 12px; border-radius: 50%;
             background: #f39c12; margin-right: 8px; animation: pulse 2s infinite;
         }
+        .indicator.listening { background: #3498db; }
+        .indicator.speaking { background: #2ecc71; animation: none; }
         .indicator.connected { background: #2ecc71; }
-        .indicator.error { background: #e74c3c; }
+        .indicator.error { background: #e74c3c; animation: none; }
         @keyframes pulse {
             0%, 100% { opacity: 1; }
             50% { opacity: 0.5; }
         }
         #debug {
             position: fixed; bottom: 10px; left: 10px; right: 10px;
-            font-size: 10px; color: #888; max-height: 120px; overflow-y: auto;
-            font-family: monospace; background: rgba(0,0,0,0.5); padding: 10px;
+            font-size: 11px; color: #aaa; max-height: 150px; overflow-y: auto;
+            font-family: monospace; background: rgba(0,0,0,0.7); padding: 10px;
             border-radius: 5px;
         }
-        /* Position widget in corner */
-        elevenlabs-convai {
-            position: fixed !important;
-            bottom: 150px !important;
-            right: 20px !important;
+        .waveform {
+            width: 200px; height: 60px; margin: 20px auto;
+            display: flex; align-items: center; justify-content: center; gap: 4px;
         }
+        .bar {
+            width: 6px; background: #667eea; border-radius: 3px;
+            animation: wave 1s ease-in-out infinite;
+        }
+        .bar:nth-child(1) { animation-delay: 0s; height: 20px; }
+        .bar:nth-child(2) { animation-delay: 0.1s; height: 35px; }
+        .bar:nth-child(3) { animation-delay: 0.3s; height: 50px; }
+        .bar:nth-child(4) { animation-delay: 0.2s; height: 35px; }
+        .bar:nth-child(5) { animation-delay: 0.4s; height: 20px; }
+        @keyframes wave {
+            0%, 100% { transform: scaleY(0.5); }
+            50% { transform: scaleY(1); }
+        }
+        .waveform.idle .bar { animation: none; transform: scaleY(0.3); }
     </style>
-    <script src="https://unpkg.com/@elevenlabs/convai-widget-embed" async></script>
 </head>
 <body>
     <div class="container">
         <div class="logo">🦁</div>
         <h1 class="title">Rafiki</h1>
+        <div class="waveform idle" id="waveform">
+            <div class="bar"></div>
+            <div class="bar"></div>
+            <div class="bar"></div>
+            <div class="bar"></div>
+            <div class="bar"></div>
+        </div>
         <p class="status">
             <span class="indicator" id="statusIndicator"></span>
-            <span id="statusText">Loading widget...</span>
+            <span id="statusText">Initializing...</span>
         </p>
     </div>
     <div id="debug"></div>
 
-    <!-- ElevenLabs Widget -->
-    <elevenlabs-convai agent-id="agent_5801kdgpnzv8e3qvqq4r18k7v7p7"></elevenlabs-convai>
+    <script type="module">
+        // ========== Configuration ==========
+        const AGENT_ID = 'agent_5801kdgpnzv8e3qvqq4r18k7v7p7';
 
-    <script>
+        // ========== UI Elements ==========
         const statusText = document.getElementById('statusText');
         const statusIndicator = document.getElementById('statusIndicator');
+        const waveform = document.getElementById('waveform');
         const debug = document.getElementById('debug');
 
-        function log(msg) {
-            console.log('[Rafiki]', msg);
+        // ========== Logging ==========
+        function log(msg, type = 'info') {
+            const timestamp = new Date().toLocaleTimeString();
+            console.log(`[Rafiki ${type}]`, msg);
             const line = document.createElement('div');
-            line.textContent = new Date().toLocaleTimeString() + ' ' + msg;
+            line.style.color = type === 'error' ? '#e74c3c' : type === 'success' ? '#2ecc71' : '#aaa';
+            line.textContent = `${timestamp} ${msg}`;
             debug.appendChild(line);
             debug.scrollTop = debug.scrollHeight;
-            if (debug.children.length > 20) debug.removeChild(debug.firstChild);
+            if (debug.children.length > 30) debug.removeChild(debug.firstChild);
         }
 
-        log('Page loaded');
-
-        // Wait for widget to load then auto-click
-        let clickAttempts = 0;
-        const maxClickAttempts = 30;
-
-        function tryAutoStart() {
-            clickAttempts++;
-            log('Auto-start attempt ' + clickAttempts);
-
-            const widget = document.querySelector('elevenlabs-convai');
-            if (!widget) {
-                log('Widget element not found');
-                if (clickAttempts < maxClickAttempts) setTimeout(tryAutoStart, 1000);
-                return;
-            }
-
-            if (!widget.shadowRoot) {
-                log('Shadow root not ready');
-                if (clickAttempts < maxClickAttempts) setTimeout(tryAutoStart, 1000);
-                return;
-            }
-
-            // Try to find and click the button
-            const button = widget.shadowRoot.querySelector('button');
-            if (button) {
-                log('Found button, clicking...');
-                button.click();
-                statusText.textContent = 'Widget activated';
-                statusIndicator.className = 'indicator connected';
-
-                // Monitor for connection status
-                setTimeout(checkConnection, 2000);
-            } else {
-                log('Button not found in shadow DOM');
-                // Try clicking the widget itself
-                widget.click();
-                if (clickAttempts < maxClickAttempts) setTimeout(tryAutoStart, 1000);
-            }
+        function setStatus(text, state = 'default') {
+            statusText.textContent = text;
+            statusIndicator.className = 'indicator ' + state;
+            waveform.className = 'waveform ' + (state === 'speaking' ? '' : 'idle');
         }
 
-        function checkConnection() {
-            const widget = document.querySelector('elevenlabs-convai');
-            if (widget && widget.shadowRoot) {
-                const inner = widget.shadowRoot.innerHTML;
-                if (inner.includes('listening') || inner.includes('speaking')) {
-                    log('Widget appears active');
-                    statusText.textContent = 'Active';
-                    statusIndicator.className = 'indicator connected';
+        // ========== Audio Context for Output ==========
+        // This is THE KEY - Recall.ai captures audio from AudioContext destination
+        let audioContext = null;
+        let nextPlayTime = 0;
+
+        async function initAudioContext() {
+            if (!audioContext) {
+                audioContext = new (window.AudioContext || window.webkitAudioContext)({
+                    sampleRate: 16000
+                });
+                log('AudioContext created: ' + audioContext.state);
+            }
+
+            if (audioContext.state === 'suspended') {
+                await audioContext.resume();
+                log('AudioContext resumed');
+            }
+            return audioContext;
+        }
+
+        // ========== PCM Audio Playback via Web Audio API ==========
+        async function playPCMAudio(base64Audio, sampleRate = 16000) {
+            try {
+                const ctx = await initAudioContext();
+
+                // Decode base64 to bytes
+                const binaryString = atob(base64Audio);
+                const bytes = new Uint8Array(binaryString.length);
+                for (let i = 0; i < binaryString.length; i++) {
+                    bytes[i] = binaryString.charCodeAt(i);
                 }
+
+                // Convert Int16 PCM to Float32
+                const int16 = new Int16Array(bytes.buffer);
+                const float32 = new Float32Array(int16.length);
+                for (let i = 0; i < int16.length; i++) {
+                    float32[i] = int16[i] / 32768.0;
+                }
+
+                // Create audio buffer
+                const audioBuffer = ctx.createBuffer(1, float32.length, sampleRate);
+                audioBuffer.getChannelData(0).set(float32);
+
+                // Schedule playback for gapless audio
+                const source = ctx.createBufferSource();
+                source.buffer = audioBuffer;
+
+                const gainNode = ctx.createGain();
+                gainNode.gain.value = 1.0;
+
+                source.connect(gainNode);
+                gainNode.connect(ctx.destination);
+
+                // Gapless scheduling
+                const startTime = Math.max(ctx.currentTime, nextPlayTime);
+                source.start(startTime);
+                nextPlayTime = startTime + audioBuffer.duration;
+
+                return audioBuffer.duration;
+            } catch (e) {
+                log('Audio error: ' + e.message, 'error');
+                return 0;
             }
-            setTimeout(checkConnection, 5000);
         }
 
-        // Start auto-click attempts after widget script loads
-        setTimeout(tryAutoStart, 2000);
+        // ========== Microphone Capture ==========
+        async function getMicrophone() {
+            log('Requesting microphone...');
+            try {
+                const stream = await navigator.mediaDevices.getUserMedia({
+                    audio: {
+                        sampleRate: 16000,
+                        channelCount: 1,
+                        echoCancellation: true,
+                        noiseSuppression: true,
+                        autoGainControl: true
+                    }
+                });
+                log('Microphone ready', 'success');
+                return stream;
+            } catch (e) {
+                log('Mic error: ' + e.message, 'error');
+                throw e;
+            }
+        }
 
-        // Also request mic permission proactively
-        navigator.mediaDevices.getUserMedia({ audio: true })
-            .then(stream => {
-                log('Microphone permission granted');
-                stream.getTracks().forEach(t => t.stop());
-            })
-            .catch(e => log('Mic permission: ' + e.message));
+        // ========== WebSocket to ElevenLabs ==========
+        let ws = null;
+        let isConnected = false;
+
+        async function connectToElevenLabs() {
+            setStatus('Connecting...', 'default');
+
+            try {
+                await initAudioContext();
+                const micStream = await getMicrophone();
+
+                // Connect WebSocket
+                const wsUrl = `wss://api.elevenlabs.io/v1/convai/conversation?agent_id=${AGENT_ID}`;
+                log('Connecting to ElevenLabs...');
+
+                ws = new WebSocket(wsUrl);
+
+                ws.onopen = () => {
+                    log('Connected!', 'success');
+                    isConnected = true;
+                    setStatus('Listening...', 'listening');
+                    startAudioCapture(micStream);
+                };
+
+                ws.onmessage = (event) => {
+                    try {
+                        const msg = JSON.parse(event.data);
+                        handleWSMessage(msg);
+                    } catch (e) {
+                        log('Parse error', 'error');
+                    }
+                };
+
+                ws.onerror = (e) => {
+                    log('WS error', 'error');
+                    setStatus('Error', 'error');
+                };
+
+                ws.onclose = () => {
+                    log('Disconnected, reconnecting in 3s...');
+                    isConnected = false;
+                    setStatus('Reconnecting...', 'error');
+                    setTimeout(connectToElevenLabs, 3000);
+                };
+
+            } catch (e) {
+                log('Failed: ' + e.message, 'error');
+                setStatus('Failed, retrying...', 'error');
+                setTimeout(connectToElevenLabs, 5000);
+            }
+        }
+
+        function handleWSMessage(msg) {
+            switch (msg.type) {
+                case 'conversation_initiation_metadata':
+                    log('Session: ' + msg.conversation_id);
+                    break;
+
+                case 'audio':
+                    // RAFIKI IS SPEAKING - play via Web Audio API
+                    if (msg.audio?.chunk) {
+                        setStatus('Speaking...', 'speaking');
+                        playPCMAudio(msg.audio.chunk, msg.audio.sample_rate || 16000);
+                    }
+                    break;
+
+                case 'agent_response':
+                    if (msg.agent_response) {
+                        log('Rafiki: ' + msg.agent_response.substring(0, 60));
+                    }
+                    break;
+
+                case 'user_transcript':
+                    if (msg.user_transcript) {
+                        log('You: ' + msg.user_transcript.substring(0, 60));
+                    }
+                    break;
+
+                case 'agent_response_end':
+                    setTimeout(() => setStatus('Listening...', 'listening'), 500);
+                    break;
+
+                case 'ping':
+                    if (ws?.readyState === WebSocket.OPEN) {
+                        ws.send(JSON.stringify({ type: 'pong' }));
+                    }
+                    break;
+
+                case 'error':
+                    log('Error: ' + (msg.message || msg.error), 'error');
+                    break;
+            }
+        }
+
+        function startAudioCapture(stream) {
+            const captureCtx = new AudioContext({ sampleRate: 16000 });
+            const source = captureCtx.createMediaStreamSource(stream);
+            const processor = captureCtx.createScriptProcessor(4096, 1, 1);
+
+            processor.onaudioprocess = (e) => {
+                if (!isConnected || ws?.readyState !== WebSocket.OPEN) return;
+
+                const input = e.inputBuffer.getChannelData(0);
+
+                // Convert Float32 to Int16 PCM
+                const int16 = new Int16Array(input.length);
+                for (let i = 0; i < input.length; i++) {
+                    const s = Math.max(-1, Math.min(1, input[i]));
+                    int16[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+                }
+
+                // Base64 encode
+                const uint8 = new Uint8Array(int16.buffer);
+                let binary = '';
+                for (let i = 0; i < uint8.length; i++) {
+                    binary += String.fromCharCode(uint8[i]);
+                }
+
+                ws.send(JSON.stringify({
+                    type: 'audio',
+                    audio: { chunk: btoa(binary), sample_rate: 16000 }
+                }));
+            };
+
+            source.connect(processor);
+            processor.connect(captureCtx.destination);
+            log('Audio capture started', 'success');
+        }
+
+        // ========== Keep AudioContext alive ==========
+        setInterval(async () => {
+            if (audioContext?.state === 'suspended') {
+                await audioContext.resume();
+            }
+        }, 3000);
+
+        // ========== AUTO-START ==========
+        log('Rafiki Meeting Agent v2 loaded');
+        log('Auto-starting in 1 second...');
+
+        setTimeout(() => {
+            connectToElevenLabs();
+        }, 1000);
     </script>
 </body>
 </html>
