@@ -1,0 +1,457 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Rafiki Meeting Agent</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
+            color: #eee;
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            min-height: 100vh;
+        }
+        .container { text-align: center; padding: 40px; }
+        .logo { font-size: 80px; margin-bottom: 20px; }
+        .title {
+            font-size: 32px; font-weight: 600; margin-bottom: 10px;
+            background: linear-gradient(90deg, #667eea 0%, #764ba2 100%);
+            -webkit-background-clip: text; -webkit-text-fill-color: transparent;
+        }
+        .status { font-size: 18px; color: #888; margin-bottom: 30px; }
+        .indicator {
+            display: inline-block; width: 12px; height: 12px; border-radius: 50%;
+            background: #f39c12; margin-right: 8px; animation: pulse 2s infinite;
+        }
+        .indicator.listening { background: #2ecc71; }
+        .indicator.speaking { background: #3498db; animation: none; }
+        .indicator.error { background: #e74c3c; animation: none; }
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.5; }
+        }
+        #debug {
+            position: fixed; bottom: 10px; left: 10px; right: 10px;
+            font-size: 10px; color: #888; max-height: 150px; overflow-y: auto;
+            font-family: monospace; background: rgba(0,0,0,0.5); padding: 10px;
+            border-radius: 5px;
+        }
+        #transcript {
+            max-width: 600px; margin-top: 20px; padding: 15px;
+            background: rgba(255,255,255,0.1); border-radius: 10px;
+            font-size: 14px; min-height: 60px;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="logo">🦁</div>
+        <h1 class="title">Rafiki</h1>
+        <p class="status">
+            <span class="indicator" id="statusIndicator"></span>
+            <span id="statusText">Initializing...</span>
+        </p>
+        <div id="transcript"></div>
+    </div>
+    <div id="debug"></div>
+
+    <script>
+        // ============================================
+        // CONFIGURATION
+        // ============================================
+        const AGENT_ID = 'agent_5801kdgpnzv8e3qvqq4r18k7v7p7';
+        const INPUT_SAMPLE_RATE = 16000;  // ElevenLabs expects 16kHz input
+        const OUTPUT_SAMPLE_RATE = 16000; // ElevenLabs sends 16kHz output
+        const TARGET_SAMPLE_RATE = 48000; // Chrome/Recall.ai expects 48kHz
+
+        // ============================================
+        // STATE
+        // ============================================
+        let websocket = null;
+        let audioContext = null;
+        let micStream = null;
+        let micProcessor = null;
+        let isConnected = false;
+        let isSpeaking = false;
+        let audioQueue = [];
+        let isPlaying = false;
+
+        // ============================================
+        // UI HELPERS
+        // ============================================
+        const statusText = document.getElementById('statusText');
+        const statusIndicator = document.getElementById('statusIndicator');
+        const debug = document.getElementById('debug');
+        const transcript = document.getElementById('transcript');
+
+        function log(msg) {
+            console.log('[Rafiki]', msg);
+            const line = document.createElement('div');
+            line.textContent = new Date().toLocaleTimeString() + ' ' + msg;
+            debug.appendChild(line);
+            debug.scrollTop = debug.scrollHeight;
+            if (debug.children.length > 50) debug.removeChild(debug.firstChild);
+        }
+
+        function setStatus(status, text) {
+            statusIndicator.className = 'indicator ' + status;
+            statusText.textContent = text;
+        }
+
+        function showTranscript(role, text) {
+            const prefix = role === 'user' ? '🗣️ You: ' : '🦁 Rafiki: ';
+            transcript.textContent = prefix + text;
+        }
+
+        // ============================================
+        // AUDIO CONTEXT SETUP (48kHz for Recall.ai)
+        // ============================================
+        async function initAudioContext() {
+            // Create AudioContext at 48kHz - Chrome's default, matches Recall.ai
+            audioContext = new (window.AudioContext || window.webkitAudioContext)({
+                sampleRate: TARGET_SAMPLE_RATE
+            });
+
+            // Resume if suspended (autoplay policy)
+            if (audioContext.state === 'suspended') {
+                await audioContext.resume();
+            }
+
+            log(`AudioContext initialized at ${audioContext.sampleRate}Hz`);
+            return audioContext;
+        }
+
+        // ============================================
+        // MICROPHONE CAPTURE (Downsample to 16kHz)
+        // ============================================
+        async function startMicrophone() {
+            try {
+                // Get microphone stream
+                micStream = await navigator.mediaDevices.getUserMedia({
+                    audio: {
+                        channelCount: 1,
+                        sampleRate: { ideal: INPUT_SAMPLE_RATE },
+                        echoCancellation: true,
+                        noiseSuppression: true
+                    }
+                });
+
+                log('Microphone access granted');
+
+                // Create source from mic
+                const source = audioContext.createMediaStreamSource(micStream);
+
+                // Use ScriptProcessor to capture and downsample audio
+                // Buffer size of 4096 gives good balance of latency vs performance
+                micProcessor = audioContext.createScriptProcessor(4096, 1, 1);
+
+                // Downsampling state
+                const downsampleRatio = audioContext.sampleRate / INPUT_SAMPLE_RATE;
+
+                micProcessor.onaudioprocess = (e) => {
+                    if (!isConnected || isSpeaking) return;
+
+                    const inputData = e.inputBuffer.getChannelData(0);
+
+                    // Downsample to 16kHz
+                    const outputLength = Math.floor(inputData.length / downsampleRatio);
+                    const outputData = new Int16Array(outputLength);
+
+                    for (let i = 0; i < outputLength; i++) {
+                        const srcIndex = Math.floor(i * downsampleRatio);
+                        // Convert float32 [-1, 1] to int16 [-32768, 32767]
+                        const sample = Math.max(-1, Math.min(1, inputData[srcIndex]));
+                        outputData[i] = sample < 0 ? sample * 0x8000 : sample * 0x7FFF;
+                    }
+
+                    // Send to ElevenLabs
+                    sendAudioChunk(outputData);
+                };
+
+                source.connect(micProcessor);
+                micProcessor.connect(audioContext.destination);
+
+                log('Microphone streaming started');
+                return true;
+            } catch (err) {
+                log('Microphone error: ' + err.message);
+                setStatus('error', 'Microphone error');
+                return false;
+            }
+        }
+
+        // ============================================
+        // WEBSOCKET CONNECTION
+        // ============================================
+        function connectWebSocket() {
+            const wsUrl = `wss://api.elevenlabs.io/v1/convai/conversation?agent_id=${AGENT_ID}`;
+
+            log('Connecting to ElevenLabs...');
+            setStatus('', 'Connecting...');
+
+            websocket = new WebSocket(wsUrl);
+
+            websocket.onopen = () => {
+                log('WebSocket connected');
+                isConnected = true;
+                setStatus('listening', 'Listening...');
+
+                // Send initial configuration
+                websocket.send(JSON.stringify({
+                    type: 'conversation_initiation_client_data',
+                    conversation_config_override: {
+                        agent: {
+                            prompt: { prompt: "" },
+                            first_message: "",
+                            language: "en"
+                        },
+                        tts: {
+                            voice_id: ""
+                        }
+                    }
+                }));
+            };
+
+            websocket.onmessage = (event) => {
+                try {
+                    const data = JSON.parse(event.data);
+                    handleMessage(data);
+                } catch (err) {
+                    log('Parse error: ' + err.message);
+                }
+            };
+
+            websocket.onerror = (err) => {
+                log('WebSocket error');
+                setStatus('error', 'Connection error');
+            };
+
+            websocket.onclose = (event) => {
+                log(`WebSocket closed: ${event.code}`);
+                isConnected = false;
+                setStatus('error', 'Disconnected');
+
+                // Auto-reconnect after 3 seconds
+                setTimeout(() => {
+                    log('Attempting reconnect...');
+                    connectWebSocket();
+                }, 3000);
+            };
+        }
+
+        // ============================================
+        // MESSAGE HANDLING
+        // ============================================
+        function handleMessage(data) {
+            switch (data.type) {
+                case 'conversation_initiation_metadata':
+                    log('Conversation started: ' + data.conversation_id);
+                    break;
+
+                case 'audio':
+                    // Received audio chunk from agent
+                    if (data.audio_event && data.audio_event.audio_base_64) {
+                        queueAudio(data.audio_event.audio_base_64);
+                    }
+                    break;
+
+                case 'agent_response':
+                    // Agent's text response
+                    if (data.agent_response_event && data.agent_response_event.agent_response) {
+                        showTranscript('agent', data.agent_response_event.agent_response);
+                    }
+                    isSpeaking = true;
+                    setStatus('speaking', 'Speaking...');
+                    break;
+
+                case 'agent_response_correction':
+                    // Updated transcript
+                    if (data.agent_response_correction_event) {
+                        showTranscript('agent', data.agent_response_correction_event.corrected_response);
+                    }
+                    break;
+
+                case 'user_transcript':
+                    // User's speech transcribed
+                    if (data.user_transcription_event && data.user_transcription_event.user_transcript) {
+                        showTranscript('user', data.user_transcription_event.user_transcript);
+                    }
+                    break;
+
+                case 'interruption':
+                    // User interrupted agent
+                    log('Interrupted');
+                    audioQueue = [];
+                    isSpeaking = false;
+                    setStatus('listening', 'Listening...');
+                    break;
+
+                case 'ping':
+                    // Respond to ping
+                    if (data.ping_event) {
+                        websocket.send(JSON.stringify({
+                            type: 'pong',
+                            event_id: data.ping_event.event_id
+                        }));
+                    }
+                    break;
+
+                case 'agent_response_end':
+                    // Agent finished speaking
+                    log('Response complete');
+                    break;
+
+                default:
+                    // Log unknown message types for debugging
+                    if (data.type) {
+                        log('MSG: ' + data.type);
+                    }
+            }
+        }
+
+        // ============================================
+        // SEND AUDIO TO ELEVENLABS
+        // ============================================
+        function sendAudioChunk(int16Array) {
+            if (!websocket || websocket.readyState !== WebSocket.OPEN) return;
+
+            // Convert Int16Array to base64
+            const uint8Array = new Uint8Array(int16Array.buffer);
+            let binary = '';
+            for (let i = 0; i < uint8Array.length; i++) {
+                binary += String.fromCharCode(uint8Array[i]);
+            }
+            const base64 = btoa(binary);
+
+            websocket.send(JSON.stringify({
+                user_audio_chunk: base64
+            }));
+        }
+
+        // ============================================
+        // AUDIO PLAYBACK WITH RESAMPLING (16kHz -> 48kHz)
+        // ============================================
+        function queueAudio(base64Audio) {
+            audioQueue.push(base64Audio);
+            if (!isPlaying) {
+                playNextAudio();
+            }
+        }
+
+        async function playNextAudio() {
+            if (audioQueue.length === 0) {
+                isPlaying = false;
+                isSpeaking = false;
+                setStatus('listening', 'Listening...');
+                return;
+            }
+
+            isPlaying = true;
+            const base64Audio = audioQueue.shift();
+
+            try {
+                // Decode base64 to binary
+                const binaryString = atob(base64Audio);
+                const bytes = new Uint8Array(binaryString.length);
+                for (let i = 0; i < binaryString.length; i++) {
+                    bytes[i] = binaryString.charCodeAt(i);
+                }
+
+                // Convert to Int16 samples (ElevenLabs sends S16LE)
+                const int16Samples = new Int16Array(bytes.buffer);
+
+                // Convert to Float32 for Web Audio API
+                const float32Samples = new Float32Array(int16Samples.length);
+                for (let i = 0; i < int16Samples.length; i++) {
+                    float32Samples[i] = int16Samples[i] / 32768.0;
+                }
+
+                // Resample from 16kHz to 48kHz (3x upsample)
+                const resampleRatio = TARGET_SAMPLE_RATE / OUTPUT_SAMPLE_RATE;
+                const resampledLength = Math.floor(float32Samples.length * resampleRatio);
+                const resampledSamples = new Float32Array(resampledLength);
+
+                // Linear interpolation for resampling
+                for (let i = 0; i < resampledLength; i++) {
+                    const srcIndex = i / resampleRatio;
+                    const srcIndexFloor = Math.floor(srcIndex);
+                    const srcIndexCeil = Math.min(srcIndexFloor + 1, float32Samples.length - 1);
+                    const fraction = srcIndex - srcIndexFloor;
+
+                    resampledSamples[i] = float32Samples[srcIndexFloor] * (1 - fraction) +
+                                          float32Samples[srcIndexCeil] * fraction;
+                }
+
+                // Create AudioBuffer at 48kHz
+                const audioBuffer = audioContext.createBuffer(1, resampledLength, TARGET_SAMPLE_RATE);
+                audioBuffer.getChannelData(0).set(resampledSamples);
+
+                // Play the buffer
+                const source = audioContext.createBufferSource();
+                source.buffer = audioBuffer;
+                source.connect(audioContext.destination);
+
+                source.onended = () => {
+                    playNextAudio();
+                };
+
+                source.start();
+
+            } catch (err) {
+                log('Playback error: ' + err.message);
+                playNextAudio();
+            }
+        }
+
+        // ============================================
+        // INITIALIZATION (Auto-start for Recall.ai)
+        // ============================================
+        async function init() {
+            log('Rafiki Meeting Agent initializing...');
+
+            try {
+                // Initialize audio context at 48kHz
+                await initAudioContext();
+
+                // Start microphone
+                const micOk = await startMicrophone();
+                if (!micOk) {
+                    throw new Error('Microphone failed');
+                }
+
+                // Connect to ElevenLabs
+                connectWebSocket();
+
+                log('Initialization complete');
+
+            } catch (err) {
+                log('Init error: ' + err.message);
+                setStatus('error', 'Initialization failed');
+            }
+        }
+
+        // Auto-start immediately (for Recall.ai headless browser)
+        // No user interaction required
+        window.addEventListener('load', () => {
+            log('Page loaded, starting in 500ms...');
+            setTimeout(init, 500);
+        });
+
+        // Also try to resume AudioContext on any interaction (fallback)
+        document.addEventListener('click', async () => {
+            if (audioContext && audioContext.state === 'suspended') {
+                await audioContext.resume();
+                log('AudioContext resumed via click');
+            }
+            if (!isConnected) {
+                init();
+            }
+        });
+    </script>
+</body>
+</html>
