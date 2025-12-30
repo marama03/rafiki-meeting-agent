@@ -244,9 +244,11 @@
                     break;
 
                 case 'audio':
-                    if (msg.audio?.chunk) {
+                    // ElevenLabs sends audio_event.audio_base_64
+                    if (msg.audio_event?.audio_base_64) {
                         setStatus('Speaking...', 'speaking');
-                        playPCMAudio(msg.audio.chunk, msg.audio.sample_rate || 16000);
+                        log('Playing audio chunk ' + msg.audio_event.event_id);
+                        playPCMAudio(msg.audio_event.audio_base_64, 16000);
                     }
                     break;
 
